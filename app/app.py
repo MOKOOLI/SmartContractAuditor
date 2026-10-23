@@ -3,13 +3,13 @@ import sys
 import os
 import networkx as nx
 import matplotlib.pyplot as plt
+import torch
 
-# اضافه کردن مسیر src به سیستم تا ماژول‌ها رو پیدا کنه
+# اضافه کردن مسیر src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.utils.graph_builder import SolidityGraphBuilder
 from src.models.gnn_model import SmartContractGAT
-import torch
 
 st.set_page_config(page_title="Smart-Contract Auditor", page_icon="🛡️", layout="wide")
 
@@ -17,11 +17,31 @@ st.title("🛡️ Smart-Contract Vulnerability Auditor")
 st.markdown("""
 **تشخیص آسیب‌پذیری قراردادهای هوشمند با شبکه عصبی گرافی (GNN)**
 
-این ابزار کد سالیدیتی (Solidity) را به یک گراف (AST) تبدیل می‌کند و با استفاده از مدل GAT الگوهای خطرناک را شناسایی می‌کند.
+این ابزار کد سالیدیتی (Solidity) را به یک گراف (AST) تبدیل می‌کند و با استفاده از مدل آموزش‌دیده GraphSAGE، الگوهای خطرناک (مثل Reentrancy) را شناسایی می‌کند.
 """)
 
 # ==========================================
-# ۱. بخش ورودی کد
+# بارگذاری مدل (فقط یک بار)
+# ==========================================
+@st.cache_resource
+def load_model():
+    model = SmartContractGAT(num_node_features=4, hidden_channels=16)
+    model_path = os.path.join(os.path.dirname(__file__), '..', 'src', 'models', 'smart_contract_gnn.pth')
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        model.eval()
+        return model
+    else:
+        return None
+
+model = load_model()
+
+if model is None:
+    st.error("⚠️ فایل مدل آموزش‌دیده پیدا نشد. لطفاً ابتدا `python -m src.train` را اجرا کنید.")
+    st.stop()
+
+# ==========================================
+# ورودی
 # ==========================================
 st.subheader("۱. کد سالیدیتی خود را وارد کنید")
 solidity_code = st.text_area(
@@ -30,40 +50,50 @@ solidity_code = st.text_area(
     placeholder="contract MyContract {\n    // کد شما...\n}"
 )
 
-# نمونه‌ی پیش‌فرض
-if st.button("بارگذاری نمونه (Reentrancy)"):
-    solidity_code = """
-    contract VulnerableBank {
+# نمونه‌ها
+col_btn1, col_btn2 = st.columns([1, 1])
+with col_btn1:
+    if st.button("بارگذاری نمونه آسیب‌پذیر (Reentrancy)"):
+        st.session_state['code'] = """
+    contract Vulnerable {
         mapping(address => uint) public balances;
-        
         function withdraw() public {
             uint amount = balances[msg.sender];
             (bool success, ) = msg.sender.call{value: amount}("");
-            require(success, "Transfer failed");
             balances[msg.sender] = 0;
         }
     }
     """
-    st.session_state['solidity_code'] = solidity_code
+with col_btn2:
+    if st.button("بارگذاری نمونه سالم"):
+        st.session_state['code'] = """
+    contract Safe {
+        mapping(address => uint) public balances;
+        function withdraw() public {
+            uint amount = balances[msg.sender];
+            balances[msg.sender] = 0;
+            (bool success, ) = msg.sender.transfer(amount);
+        }
+    }
+    """
 
+# استفاده از کد نمونه اگر دکمه زده شده
+if 'code' in st.session_state:
+    solidity_code = st.session_state['code']
+
+# ==========================================
+# تحلیل
+# ==========================================
 if st.button("تحلیل امنیتی", type="primary"):
     if not solidity_code.strip():
         st.warning("لطفاً کد سالیدیتی را وارد کنید.")
     else:
         with st.spinner("در حال تحلیل گراف و اجرای مدل GNN..."):
             try:
-                # ۱. ساخت گراف
                 builder = SolidityGraphBuilder()
                 graph = builder.parse_contract(solidity_code)
-                
-                # ۲. تبدیل به داده PyG
                 data = builder.graph_to_pyg_data(graph)
                 
-                # ۳. مدل (در این دمو از یک مدل آموزش‌دیده‌نشده/تصادفی استفاده می‌کنیم)
-                model = SmartContractGAT(num_node_features=1, hidden_channels=16)
-                model.eval()
-                
-                # اگر گراف خالی بود، یک نود مجازی بساز
                 if data.num_nodes == 0:
                     st.error("هیچ ساختار قابل تشخیصی در کد پیدا نشد.")
                 else:
@@ -72,27 +102,26 @@ if st.button("تحلیل امنیتی", type="primary"):
                         out = model(data.x, data.edge_index, batch)
                         prob = torch.exp(out).squeeze().tolist()
                     
-                    # ۴. نمایش نتایج
+                    if isinstance(prob, float):
+                        prob = [1-prob, prob]
+                    
                     col1, col2 = st.columns(2)
                     
                     with col1:
                         st.subheader("نتیجه تحلیل")
-                        # در اینجا فرض می‌کنیم کلاس ۰ سالم و کلاس ۱ آسیب‌پذیر است
-                        vuln_prob = prob[1] if isinstance(prob, list) else prob
+                        vuln_prob = prob[1]
                         st.metric("احتمال آسیب‌پذیری", f"{vuln_prob:.1%}")
                         
                         if vuln_prob > 0.5:
-                            st.error("🚨 **آسیب‌پذیر**: الگوهای خطرناکی در کد شناسایی شد.")
+                            st.error("🚨 **آسیب‌پذیر**: الگوهای خطرناکی مانند Reentrancy شناسایی شد.")
                         else:
                             st.success("✅ **سالم**: هیچ الگوی خطرناکی شناسایی نشد.")
                             
                     with col2:
                         st.subheader("گراف ساختاری (AST)")
-                        # رسم گراف با NetworkX
                         fig, ax = plt.subplots(figsize=(6, 4))
                         pos = nx.spring_layout(graph, seed=42)
                         
-                        # رنگ‌بندی بر اساس نوع نود
                         node_colors = []
                         for node in graph.nodes(data=True):
                             ntype = node[1].get('type', 'other')
@@ -109,7 +138,6 @@ if st.button("تحلیل امنیتی", type="primary"):
                                 font_size=8, node_size=800, edge_color='gray')
                         st.pyplot(fig)
 
-                # ۵. نمایش جزئیات فنی
                 with st.expander("مشاهده جزئیات فنی"):
                     st.write(f"تعداد نودها: {graph.number_of_nodes()}")
                     st.write(f"تعداد یال‌ها: {graph.number_of_edges()}")

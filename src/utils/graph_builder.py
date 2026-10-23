@@ -1,15 +1,14 @@
 import re
 import networkx as nx
-from typing import Dict, List, Tuple
+import torch
+from torch_geometric.data import Data
+from typing import Dict, List
 
 class SolidityGraphBuilder:
     """
     یک کلاس برای تبدیل کد سالیدیتی به گراف (AST-like).
-    این نسخه از Regex برای استخراج موجودیت‌ها استفاده می‌کنه.
-    در نسخه‌های صنعتی از solc (کامپایلر) استفاده میشه، اما برای دموی سبک این کافیه.
     """
     def __init__(self):
-        # الگوهای ساده برای پیدا کردن ساختارها
         self.function_pattern = re.compile(r'function\s+(\w+)\s*\(([^)]*)\)')
         self.call_pattern = re.compile(r'(\w+)\s*\.\s*(call|delegatecall|send|transfer)\s*\(')
         self.variable_pattern = re.compile(r'(uint|int|address|bool|string)\s+(?:public|private|internal)?\s*(\w+)')
@@ -20,22 +19,18 @@ class SolidityGraphBuilder:
         
         # ۱. پیدا کردن توابع
         functions = self.function_pattern.findall(source_code)
-        for i, (func_name, args) in enumerate(functions):
+        for func_name, args in functions:
             G.add_node(func_name, type="function", args=args)
-            
-            # اگر تابع پارامتر داشت، به عنوان نود متغیر اضافه کن
             if args.strip():
                 for arg in args.split(','):
                     arg_name = arg.strip().split()[-1] if arg.strip() else "unknown"
                     G.add_node(arg_name, type="variable")
                     G.add_edge(func_name, arg_name, relation="has_param")
 
-        # ۲. پیدا کردن فراخوانی‌های خطرناک (مثل call, delegatecall)
+        # ۲. پیدا کردن فراخوانی‌های خطرناک
         for match in self.call_pattern.finditer(source_code):
             target, call_type = match.groups()
-            # پیدا کردن تابعی که این فراخوانی داخلش هست (ساده‌سازی شده)
             G.add_node(call_type, type="dangerous_call")
-            # برای سادگی به یک نود مجازی وصلش می‌کنیم
             G.add_edge("Contract", call_type, relation="contains_call")
 
         # ۳. پیدا کردن متغیرهای حالت
@@ -46,39 +41,34 @@ class SolidityGraphBuilder:
 
         return G
 
-    def graph_to_pyg_data(self, G: nx.DiGraph):
-        """
-        تبدیل گراف NetworkX به فرمت PyTorch Geometric.
-        این تابع برای زمانی است که بخواهیم مدل GNN را آموزش دهیم.
-        """
-        # در اینجا یک تبدیل ساده انجام می‌دهیم. در پروژه واقعی باید ویژگی‌ها (Features) و لیبل‌ها رو دقیق تعریف کرد.
-        import torch
-        from torch_geometric.data import Data
-        
-        # نقشه‌برداری از نام نودها به ایندکس
+    def graph_to_pyg_data(self, G: nx.DiGraph) -> Data:
+        """تبدیل گراف NetworkX به فرمت PyTorch Geometric با ویژگی‌های غنی‌تر."""
         node_mapping = {node: i for i, node in enumerate(G.nodes())}
-        
-        # ساخت لیست یال‌ها
         edge_index = []
         for u, v in G.edges():
             edge_index.append([node_mapping[u], node_mapping[v]])
         
-        # تبدیل به تنسور
-        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        if len(edge_index) == 0:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+        else:
+            edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
         
-        # ویژگی‌های ساده برای هر نود (مثلاً نوع نود رو به عدد تبدیل می‌کنیم)
-        # 0: function, 1: variable, 2: dangerous_call, 3: other
-        type_map = {"function": 0, "variable": 1, "dangerous_call": 2}
+        # ویژگی‌های ۴ بعدی: [نوع نود, درجه ورودی, درجه خروجی, آیا نود Contract است]
         x = []
         for node in G.nodes():
             node_type = G.nodes[node].get("type", "other")
-            x.append([type_map.get(node_type, 3)])
+            type_val = {"function": 0, "variable": 1, "dangerous_call": 2}.get(node_type, 3)
+            
+            in_deg = G.in_degree(node)
+            out_deg = G.out_degree(node)
+            is_contract = 1.0 if node == "Contract" else 0.0
+            
+            x.append([float(type_val), float(in_deg), float(out_deg), is_contract])
         
         x = torch.tensor(x, dtype=torch.float)
         
         return Data(x=x, edge_index=edge_index)
 
-# --- تست سریع (اختیاری) ---
 if __name__ == "__main__":
     sample_code = """
     contract Vulnerable {
@@ -92,7 +82,8 @@ if __name__ == "__main__":
     """
     builder = SolidityGraphBuilder()
     graph = builder.parse_contract(sample_code)
+    data = builder.graph_to_pyg_data(graph)
     
-    print(f"تعداد نودها: {graph.number_of_nodes()}")
-    print(f"تعداد یال‌ها: {graph.number_of_edges()}")
-    print("نودها:", list(graph.nodes(data=True)))
+    print(f"تعداد نودها: {data.num_nodes}")
+    print(f"تعداد یال‌ها: {data.num_edges}")
+    print(f"ابعاد ویژگی نودها (x): {data.x.shape}")
